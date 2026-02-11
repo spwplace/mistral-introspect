@@ -6,7 +6,10 @@ use mistralrs_quant::{
     ShardedVarBuilder,
 };
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
@@ -334,6 +337,7 @@ pub struct Model {
     max_seq_len: usize,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     cfg: ModelConfigMetadata,
+    pub introspection: Arc<Mutex<crate::models::qwen3_next::IntrospectionState>>,
 }
 
 impl Model {
@@ -459,6 +463,9 @@ impl Model {
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
+            introspection: Arc::new(Mutex::new(
+                crate::models::qwen3_next::IntrospectionState::new(),
+            )),
         })
     }
 
@@ -495,6 +502,19 @@ impl Model {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
+        // Introspection: capture embedding output (layer index 0)
+        {
+            let mut intro = self.introspection.lock().unwrap();
+            if intro.capture
+                && intro
+                    .capture_layers
+                    .as_ref()
+                    .map_or(true, |s| s.contains(&0))
+            {
+                intro.hidden_states.push(xs.clone());
+            }
+        }
+
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             input_ids,
@@ -526,7 +546,29 @@ impl Model {
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
-            )?
+            )?;
+
+            // Introspection: capture hidden state after this layer, inject steering vector
+            {
+                let mut intro = self.introspection.lock().unwrap();
+                let capture_idx = i + 1;
+                if intro.capture
+                    && intro
+                        .capture_layers
+                        .as_ref()
+                        .map_or(true, |s| s.contains(&capture_idx))
+                {
+                    intro.hidden_states.push(xs.clone());
+                }
+                if let Some(sv) = intro.steering_vectors.get(&i) {
+                    let sv = if sv.dtype() != xs.dtype() {
+                        sv.to_dtype(xs.dtype())?
+                    } else {
+                        sv.clone()
+                    };
+                    xs = xs.broadcast_add(&sv)?;
+                }
+            }
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
@@ -539,6 +581,104 @@ impl Model {
 
     pub fn embed_dtype(&self) -> DType {
         self.embed_tokens.embeddings().dtype()
+    }
+
+    // ====================== Introspection Methods ======================
+
+    /// Run a forward pass that captures hidden states at every layer.
+    /// Returns (logits, hidden_states) where:
+    ///   hidden_states[0] = after embedding
+    ///   hidden_states[i+1] = after decoder layer i
+    pub fn forward_introspect(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        {
+            let mut intro = self.introspection.lock().unwrap();
+            intro.capture = true;
+            intro.hidden_states.clear();
+        }
+
+        let logits =
+            self.forward(input_ids, seqlen_offsets, context_lens, metadata, flash_params)?;
+
+        let hidden_states = {
+            let mut intro = self.introspection.lock().unwrap();
+            intro.capture = false;
+            std::mem::take(&mut intro.hidden_states)
+        };
+
+        Ok((logits, hidden_states))
+    }
+
+    /// Project a hidden state through the final RMSNorm and lm_head ("logit lens").
+    pub fn logit_lens(&self, hidden_state: &Tensor) -> Result<Tensor> {
+        let h = self.norm.forward(hidden_state)?;
+        let mut h = h;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            h = h.to_dtype(t)?;
+        }
+        let logits = MatMul.qmethod_matmul(&h, &*self.lm_head)?;
+        if self.lm_head.quantized_act_type().is_some() {
+            Ok(logits.to_dtype(hidden_state.dtype())?)
+        } else {
+            Ok(logits)
+        }
+    }
+
+    /// Batched logit lens across all captured hidden states.
+    pub fn logit_lens_all(&self, hidden_states: &[Tensor]) -> Result<Vec<Tensor>> {
+        use candle_core::IndexOp;
+
+        if hidden_states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let last_positions: Vec<Tensor> = hidden_states
+            .iter()
+            .map(|hs| {
+                let seq_dim = hs.dim(1)?;
+                hs.i((.., seq_dim - 1, ..))?.squeeze(1)
+            })
+            .collect::<Result<_>>()?;
+        let stacked = Tensor::stack(&last_positions, 0)?;
+        let logits = self.logit_lens(&stacked)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
+        let mut results = Vec::with_capacity(hidden_states.len());
+        for i in 0..hidden_states.len() {
+            results.push(probs.i(i)?);
+        }
+        Ok(results)
+    }
+
+    /// Set a steering vector for a specific layer.
+    pub fn set_steering_vector(&self, layer_idx: usize, vector: Tensor) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.steering_vectors.insert(layer_idx, vector);
+    }
+
+    /// Set steering vectors for a range of layers (same vector, scaled).
+    pub fn set_steering_vectors_range(
+        &self,
+        layer_range: std::ops::Range<usize>,
+        vector: &Tensor,
+        scale: f64,
+    ) -> Result<()> {
+        let scaled = (vector * scale)?;
+        let mut intro = self.introspection.lock().unwrap();
+        for layer_idx in layer_range {
+            intro.steering_vectors.insert(layer_idx, scaled.clone());
+        }
+        Ok(())
+    }
+
+    /// Clear all steering vectors.
+    pub fn clear_steering_vectors(&self) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.steering_vectors.clear();
     }
 }
 
@@ -622,6 +762,29 @@ impl NormalModel for Model {
             flash_params,
         )
     }
+
+    fn introspection_state(
+        &self,
+    ) -> Option<Arc<Mutex<crate::models::qwen3_next::IntrospectionState>>> {
+        Some(self.introspection.clone())
+    }
+
+    fn forward_introspect(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_introspect(input_ids, seqlen_offsets, context_lens, metadata, flash_params)
+    }
+
+    fn logit_lens(&self, hidden_state: &Tensor) -> Result<Tensor> {
+        self.logit_lens(hidden_state)
+    }
+
     fn xlora_forward(
         &self,
         _input_ids: &Tensor,

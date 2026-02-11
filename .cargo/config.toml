@@ -1,10 +1,11 @@
 [build]
-rustflags = ["-C", "target-cpu=native"]
+# target-cpu=native triggers LLVM ICE on nightly 2026-02+;
+# use apple-m1 explicitly instead
+rustflags = ["-C", "target-cpu=apple-m1"]
 
 [target.aarch64-apple-darwin]
 rustflags = [
-  "-C", "target-cpu=native",
-  "-C", "target-feature=+aes,+sha2,+fp16",
+  "-C", "target-cpu=apple-m1",
 ]
 
 [target.x86_64-apple-darwin]

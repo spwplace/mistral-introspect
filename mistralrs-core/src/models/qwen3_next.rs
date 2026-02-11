@@ -1,7 +1,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{Embedding, Linear};
+use candle_nn::{Embedding};
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
     ShardedVarBuilder,
@@ -57,7 +57,7 @@ use crate::{
     device_map::DeviceMapper,
     kv_cache::{HybridCache, HybridCacheConfig, HybridLayerType},
     layers::{
-        embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding, Sdpa,
+        embedding, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
@@ -155,6 +155,45 @@ impl Config {
     /// Conv dim for GDN = key_dim * 2 + value_dim (q, k, v before split)
     pub fn linear_conv_dim(&self) -> usize {
         self.linear_key_dim() * 2 + self.linear_value_dim()
+    }
+}
+
+/// Load a linear layer with AFQ fallback for per-layer bit width overrides.
+///
+/// MLX quantized models may use different bit widths for specific layers (e.g., 8-bit
+/// for MoE gates while the global config specifies 4-bit). This tries the global config
+/// first, then falls back to trying other common AFQ bit widths (2, 3, 4, 6, 8).
+fn load_with_afq_fallback(
+    in_dim: usize,
+    out_dim: usize,
+    config: &Option<QuantizedConfig>,
+    vb: ShardedVarBuilder,
+) -> Result<Arc<dyn QuantMethod>> {
+    match ReplicatedLayer::new(in_dim, out_dim, config, false, vb.clone()) {
+        Ok(layer) => Ok(layer),
+        Err(first_err) => {
+            if let Some(QuantizedConfig::Afq { group_size, bits: global_bits }) = config {
+                // Try other common AFQ bit widths
+                for bits in [2, 3, 4, 6, 8] {
+                    if bits == *global_bits {
+                        continue; // Already tried this
+                    }
+                    let override_config = Some(QuantizedConfig::Afq {
+                        bits,
+                        group_size: *group_size,
+                    });
+                    if let Ok(layer) = ReplicatedLayer::new(
+                        in_dim, out_dim, &override_config, false, vb.clone(),
+                    ) {
+                        tracing::info!(
+                            "Per-layer AFQ override: loaded with {bits}-bit (global: {global_bits}-bit)"
+                        );
+                        return Ok(layer);
+                    }
+                }
+            }
+            Err(first_err)
+        }
     }
 }
 
@@ -336,8 +375,8 @@ fn gated_delta_rule_recurrence(
 // ====================== Gated Delta Net layer ======================
 
 struct GatedDeltaNet {
-    in_proj_qkvz: Linear,
-    in_proj_ba: Linear,
+    in_proj_qkvz: Arc<dyn QuantMethod>,
+    in_proj_ba: Arc<dyn QuantMethod>,
     conv1d_weight: Tensor,
     dt_bias: Tensor,
     a_log: Tensor,
@@ -381,14 +420,34 @@ impl GatedDeltaNet {
         // in_proj_qkvz: hidden_size -> key_dim * 2 + value_dim * 2
         // Output: [q (key_dim), k (key_dim), v (value_dim), z (value_dim)]
         let qkvz_out = key_dim * 2 + value_dim * 2;
-        let mut qkvz_w = vb_la.get((qkvz_out, cfg.hidden_size), "in_proj_qkvz.weight")?;
+        let in_proj_qkvz = ReplicatedLayer::new(
+            cfg.hidden_size,
+            qkvz_out,
+            &cfg.quantization_config,
+            false,
+            vb_la.pp("in_proj_qkvz"),
+        )?;
 
         // in_proj_ba: hidden_size -> num_v_heads * 2 (beta and alpha per head)
-        let mut ba_w = vb_la.get((num_v_heads * 2, cfg.hidden_size), "in_proj_ba.weight")?;
+        let in_proj_ba = ReplicatedLayer::new(
+            cfg.hidden_size,
+            num_v_heads * 2,
+            &cfg.quantization_config,
+            false,
+            vb_la.pp("in_proj_ba"),
+        )?;
 
-        // Conv1d weight: (conv_dim, 1, kernel_size)
+        // Conv1d weight: PyTorch stores (conv_dim, 1, kernel_size), MLX stores (conv_dim, kernel_size, 1)
         let conv_dim = key_dim * 2 + value_dim; // q, k, v concatenated
-        let mut conv1d_weight = vb_la.get((conv_dim, 1, conv_kernel_size), "conv1d.weight")?;
+        let mut conv1d_weight = match vb_la.get((conv_dim, 1, conv_kernel_size), "conv1d.weight") {
+            Ok(w) => w,
+            Err(_) => {
+                // MLX layout: (conv_dim, kernel_size, 1) -> transpose to (conv_dim, 1, kernel_size)
+                vb_la
+                    .get((conv_dim, conv_kernel_size, 1), "conv1d.weight")?
+                    .permute((0, 2, 1))?
+            }
+        };
 
         // dt_bias and A_log
         let mut dt_bias = vb_la.get(num_v_heads, "dt_bias")?;
@@ -396,15 +455,10 @@ impl GatedDeltaNet {
 
         // Move non-quantizable tensors to target device for ISQ compatibility
         if let Some(ref target_dev) = isq_target_device {
-            qkvz_w = qkvz_w.to_device(target_dev)?;
-            ba_w = ba_w.to_device(target_dev)?;
             conv1d_weight = conv1d_weight.to_device(target_dev)?;
             dt_bias = dt_bias.to_device(target_dev)?;
             a_log = a_log.to_device(target_dev)?;
         }
-
-        let in_proj_qkvz = Linear::new(qkvz_w, None);
-        let in_proj_ba = Linear::new(ba_w, None);
 
         // Gated RMSNorm for output
         let norm = RmsNormGated::new(
@@ -447,8 +501,8 @@ impl GatedDeltaNet {
         let dtype = x.dtype();
 
         // 1. Project input
-        let mixed_qkvz = self.in_proj_qkvz.forward(x)?; // (batch, seq, key_dim*2 + value_dim*2)
-        let mixed_ba = self.in_proj_ba.forward(x)?; // (batch, seq, num_v_heads * 2)
+        let mixed_qkvz = self.in_proj_qkvz.forward_autocast(x)?; // (batch, seq, key_dim*2 + value_dim*2)
+        let mixed_ba = self.in_proj_ba.forward_autocast(x)?; // (batch, seq, num_v_heads * 2)
 
         // 2. fix_query_key_value_ordering: grouped head layout
         // The projection is grouped by num_k_heads. Within each group:
@@ -1113,10 +1167,10 @@ impl Mlp {
 
 /// Sparse MoE block with shared expert and shared expert gate
 struct SparseMoeBlock {
-    gate: Linear,
+    gate: Arc<dyn QuantMethod>,
     experts: MoEExperts,
     shared_expert: Mlp,
-    shared_expert_gate: Linear,
+    shared_expert_gate: Arc<dyn QuantMethod>,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
 }
@@ -1137,10 +1191,12 @@ impl SparseMoeBlock {
             .cloned()
             .unwrap_or(real_device);
 
-        // Router gate
-        let gate = linear_no_bias(
+        // Router gate — MLX quantized models often use 8-bit for gate layers
+        // even when the global config specifies 4-bit
+        let gate = load_with_afq_fallback(
             cfg.hidden_size,
             cfg.num_experts,
+            &cfg.quantization_config,
             vb.pp("gate").set_device(layer_device.clone()),
         )?;
 
@@ -1171,14 +1227,13 @@ impl SparseMoeBlock {
             comm,
         )?;
 
-        // Shared expert gate: (1, hidden_size) -> sigmoid
-        let mut seg_w = vb
-            .pp("shared_expert_gate")
-            .get((1, cfg.hidden_size), "weight")?;
-        if loading_isq {
-            seg_w = seg_w.to_device(&layer_device)?;
-        }
-        let shared_expert_gate = Linear::new(seg_w, None);
+        // Shared expert gate — may also use different bit width
+        let shared_expert_gate = load_with_afq_fallback(
+            cfg.hidden_size,
+            1,
+            &cfg.quantization_config,
+            vb.pp("shared_expert_gate").set_device(layer_device.clone()),
+        )?;
 
         Ok(Self {
             gate,
@@ -1195,7 +1250,7 @@ impl SparseMoeBlock {
         let xs_flat = xs.reshape(((), hidden_dim))?;
 
         // 1. Router: softmax over gate logits
-        let router_logits = self.gate.forward(&xs_flat)?;
+        let router_logits = self.gate.forward_autocast(&xs_flat)?;
         let routing_weights =
             candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
 
@@ -1221,7 +1276,7 @@ impl SparseMoeBlock {
         let shared_gate = candle_nn::ops::sigmoid(
             &self
                 .shared_expert_gate
-                .forward(&xs.reshape(((), hidden_dim))?)?,
+                .forward_autocast(&xs.reshape(((), hidden_dim))?)?,
         )?;
         let shared_gate = shared_gate.reshape((b_size, seq_len, 1))?;
         let shared_out = shared_out.broadcast_mul(&shared_gate)?;
@@ -1231,7 +1286,8 @@ impl SparseMoeBlock {
     }
 
     fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
-        let mut layers = self.experts.get_isq_layers();
+        let mut layers = vec![&mut self.gate, &mut self.shared_expert_gate];
+        layers.extend(self.experts.get_isq_layers());
         layers.extend(self.shared_expert.get_isq_layers());
         layers
     }
@@ -1339,6 +1395,16 @@ impl LocalHybridCache {
             }
         }
         0
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        for cache in &mut self.caches {
+            match cache {
+                LocalLayerCache::Attention(kv) => kv.reset(),
+                LocalLayerCache::LinearAttention(gdn) => gdn.reset()?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1624,6 +1690,9 @@ impl Model {
         }
 
         let mut local_cache = self.local_cache.lock().unwrap();
+        if seqlen_offsets[0] == 0 {
+            local_cache.reset()?;
+        }
 
         let mask = CausalMasker.make_causal_mask_matrix(
             input_ids,
@@ -1664,9 +1733,6 @@ impl Model {
                     if let LocalLayerCache::LinearAttention(gdn_cache) =
                         &mut local_cache.caches[layer_idx]
                     {
-                        if seqlen_offsets[0] == 0 {
-                            gdn_cache.reset()?;
-                        }
                         x = layer.forward_linear(&x, gdn_cache)?;
                     }
                 }
@@ -1681,7 +1747,12 @@ impl Model {
                     intro.hidden_states.push(x.clone());
                 }
                 if let Some(sv) = intro.steering_vectors.get(&layer_idx) {
-                    x = x.broadcast_add(sv)?;
+                    let sv = if sv.dtype() != x.dtype() {
+                        sv.to_dtype(x.dtype())?
+                    } else {
+                        sv.clone()
+                    };
+                    x = x.broadcast_add(&sv)?;
                 }
             }
         }
@@ -1835,6 +1906,8 @@ impl IsqModel for Model {
                     tensors.push((&mut attn.o_proj, Some(i)));
                 }
                 LayerImpl::LinearAttention(gdn) => {
+                    tensors.push((&mut gdn.in_proj_qkvz, Some(i)));
+                    tensors.push((&mut gdn.in_proj_ba, Some(i)));
                     tensors.push((&mut gdn.out_proj, Some(i)));
                 }
             }
@@ -1866,14 +1939,6 @@ impl IsqModel for Model {
                 LayerImpl::LinearAttention(gdn) => {
                     uvb_l
                         .pp("linear_attn")
-                        .pp("in_proj_qkvz")
-                        .add_tensor("weight", gdn.in_proj_qkvz.weight().clone());
-                    uvb_l
-                        .pp("linear_attn")
-                        .pp("in_proj_ba")
-                        .add_tensor("weight", gdn.in_proj_ba.weight().clone());
-                    uvb_l
-                        .pp("linear_attn")
                         .add_tensor("conv1d.weight", gdn.conv1d_weight.clone());
                     uvb_l
                         .pp("linear_attn")
@@ -1888,15 +1953,7 @@ impl IsqModel for Model {
                 }
             }
 
-            // MoE gate and shared expert gate
-            uvb_l
-                .pp("mlp")
-                .pp("gate")
-                .add_tensor("weight", layer.moe.gate.weight().clone());
-            uvb_l
-                .pp("mlp")
-                .pp("shared_expert_gate")
-                .add_tensor("weight", layer.moe.shared_expert_gate.weight().clone());
+            // MoE gate and shared expert gate are now in get_layers (ISQ-managed)
         }
 
         uvb.to_safetensors()

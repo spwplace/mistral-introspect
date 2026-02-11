@@ -968,8 +968,8 @@ impl PackedExperts {
 
             match quant_conf {
                 QuantizedConfig::Afq { .. } => {
-                    if !vb.contains_tensor("gate_up_proj")
-                        || !vb.contains_tensor("gate_up_proj.weight")
+                    if vb.contains_tensor("gate_up_proj")
+                        || vb.contains_tensor("gate_up_proj.weight")
                     {
                         candle_core::bail!("PackedExperts with AFQ quantization config does not support `gate_up_proj` format.");
                     }

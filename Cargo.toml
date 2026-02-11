@@ -14,7 +14,6 @@ members = [
     "mistralrs-audio",
     "mistralrs-mcp",
     "mistralrs-macros",
-    "mistralrs-introspect",
 ]
 resolver = "2"
 
