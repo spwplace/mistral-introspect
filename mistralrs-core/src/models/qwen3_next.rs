@@ -21,17 +21,35 @@ use std::{
 ///
 /// Steering vectors in `steering_vectors` are added to the residual stream after the
 /// corresponding layer's forward pass, before the next layer.
+/// Captured MoE routing decisions from a single layer's forward pass.
+pub struct MoeRoutingData {
+    /// Raw router logits before softmax: (num_tokens, num_experts)
+    pub router_logits: Tensor,
+    /// Selected expert indices: (num_tokens, num_experts_per_tok)
+    pub topk_indices: Tensor,
+    /// Post-softmax, post-norm routing weights: (num_tokens, num_experts_per_tok)
+    pub topk_weights: Tensor,
+    /// Shared expert gate sigmoid output: (num_tokens,)
+    pub shared_gate: Tensor,
+}
+
 pub struct IntrospectionState {
     /// Per-layer hidden states from the last forward pass.
     /// Index 0 = after embedding, index i+1 = after decoder layer i.
     pub hidden_states: Vec<Tensor>,
     /// Steering vectors to add to the residual stream. Key = layer index.
     pub steering_vectors: HashMap<usize, Tensor>,
+    /// Activation patches: full hidden-state replacement at specific layers.
+    pub patch_vectors: HashMap<usize, Tensor>,
     /// Whether to capture hidden states on the next forward pass.
     pub capture: bool,
     /// If set, only capture at these layer indices (0 = embedding, 1..N = decoder layers).
     /// None means capture all layers.
     pub capture_layers: Option<std::collections::HashSet<usize>>,
+    /// Captured MoE routing data per layer (populated when capture_routing is true).
+    pub routing_data: Vec<MoeRoutingData>,
+    /// Whether to capture MoE routing decisions on the next forward pass.
+    pub capture_routing: bool,
 }
 
 impl IntrospectionState {
@@ -39,8 +57,11 @@ impl IntrospectionState {
         Self {
             hidden_states: Vec::new(),
             steering_vectors: HashMap::new(),
+            patch_vectors: HashMap::new(),
             capture: false,
             capture_layers: None,
+            routing_data: Vec::new(),
+            capture_routing: false,
         }
     }
 }
@@ -1173,6 +1194,9 @@ struct SparseMoeBlock {
     shared_expert_gate: Arc<dyn QuantMethod>,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
+    /// Captured routing data from last forward pass (when capture is enabled).
+    /// Set to Some(uninit) to arm capture, taken after forward completes.
+    routing_capture: Arc<Mutex<Option<MoeRoutingData>>>,
 }
 
 impl SparseMoeBlock {
@@ -1242,6 +1266,7 @@ impl SparseMoeBlock {
             shared_expert_gate,
             num_experts_per_tok: cfg.num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
+            routing_capture: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1266,6 +1291,22 @@ impl SparseMoeBlock {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
 
+        // Capture routing decisions (phase 1: topk data, shared_gate filled below)
+        let capturing = {
+            let mut cap = self.routing_capture.lock().unwrap();
+            if cap.is_some() {
+                *cap = Some(MoeRoutingData {
+                    router_logits: router_logits.clone(),
+                    topk_indices: topk_ids.clone(),
+                    topk_weights: topk_weights.clone(),
+                    shared_gate: Tensor::zeros(1, DType::F32, router_logits.device())?,
+                });
+                true
+            } else {
+                false
+            }
+        };
+
         // 2. Forward through routed experts
         let mut y = self.experts.forward(xs, topk_weights, &topk_ids)?;
         y = y.reshape((b_size, seq_len, hidden_dim))?;
@@ -1279,6 +1320,16 @@ impl SparseMoeBlock {
                 .forward_autocast(&xs.reshape(((), hidden_dim))?)?,
         )?;
         let shared_gate = shared_gate.reshape((b_size, seq_len, 1))?;
+
+        // Capture shared gate value
+        if capturing {
+            let mut cap = self.routing_capture.lock().unwrap();
+            if let Some(ref mut data) = *cap {
+                // shared_gate shape: (b, seq, 1) → flatten to (b*seq,)
+                data.shared_gate = shared_gate.reshape(((),))?.clone();
+            }
+        }
+
         let shared_out = shared_out.broadcast_mul(&shared_gate)?;
 
         // 4. Combine
@@ -1681,6 +1732,24 @@ impl Model {
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
 
+        // Arm MoE routing capture if requested
+        let capture_routing = {
+            let intro = self.introspection.lock().unwrap();
+            intro.capture_routing
+        };
+        if capture_routing {
+            for layer in &self.layers {
+                let mut cap = layer.moe.routing_capture.lock().unwrap();
+                // Set to Some with a dummy value — signals "armed"
+                *cap = Some(MoeRoutingData {
+                    router_logits: Tensor::zeros(1, DType::F32, &self.device)?,
+                    topk_indices: Tensor::zeros(1, DType::F32, &self.device)?,
+                    topk_weights: Tensor::zeros(1, DType::F32, &self.device)?,
+                    shared_gate: Tensor::zeros(1, DType::F32, &self.device)?,
+                });
+            }
+        }
+
         // Introspection: capture embedding output (layer index 0)
         {
             let mut intro = self.introspection.lock().unwrap();
@@ -1738,7 +1807,7 @@ impl Model {
                 }
             }
 
-            // Introspection: capture hidden state after this layer, inject steering vector
+            // Introspection: capture hidden state, inject steering/patches, collect routing
             {
                 let mut intro = self.introspection.lock().unwrap();
                 // layer_idx 0 in the loop = decoder layer 0 = capture index 1
@@ -1746,6 +1815,7 @@ impl Model {
                 if intro.capture && intro.capture_layers.as_ref().map_or(true, |s| s.contains(&capture_idx)) {
                     intro.hidden_states.push(x.clone());
                 }
+                // Steering vector injection (additive)
                 if let Some(sv) = intro.steering_vectors.get(&layer_idx) {
                     let sv = if sv.dtype() != x.dtype() {
                         sv.to_dtype(x.dtype())?
@@ -1753,6 +1823,17 @@ impl Model {
                         sv.clone()
                     };
                     x = x.broadcast_add(&sv)?;
+                }
+                // Activation patching: REPLACE hidden state entirely
+                if let Some(patch) = intro.patch_vectors.get(&layer_idx) {
+                    x = patch.to_dtype(x.dtype())?.clone();
+                }
+                // Collect routing data from this layer's MoE
+                if intro.capture_routing {
+                    let mut cap = layer.moe.routing_capture.lock().unwrap();
+                    if let Some(data) = cap.take() {
+                        intro.routing_data.push(data);
+                    }
                 }
             }
         }
@@ -1789,6 +1870,7 @@ impl Model {
             let mut intro = self.introspection.lock().unwrap();
             intro.capture = true;
             intro.hidden_states.clear();
+            intro.routing_data.clear();
         }
 
         let logits = self.forward(input_ids, seqlen_offsets, context_lens, metadata, flash_params)?;
@@ -1873,6 +1955,58 @@ impl Model {
     pub fn clear_steering_vectors(&self) {
         let mut intro = self.introspection.lock().unwrap();
         intro.steering_vectors.clear();
+    }
+
+    // ── MoE Routing Capture ─────────────────────────────────────────
+
+    /// Enable or disable MoE routing capture for subsequent forward passes.
+    pub fn set_capture_routing(&self, capture: bool) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.capture_routing = capture;
+        if !capture {
+            // Disarm all layer captures
+            for layer in &self.layers {
+                let mut cap = layer.moe.routing_capture.lock().unwrap();
+                *cap = None;
+            }
+        }
+    }
+
+    /// Take captured routing data, leaving the buffer empty.
+    /// Returns one `MoeRoutingData` per layer that was captured.
+    pub fn take_routing_data(&self) -> Vec<MoeRoutingData> {
+        let mut intro = self.introspection.lock().unwrap();
+        std::mem::take(&mut intro.routing_data)
+    }
+
+    // ── Activation Patching ─────────────────────────────────────────
+
+    /// Set a patch vector that will REPLACE the hidden state at the given layer.
+    pub fn set_patch(&self, layer_idx: usize, hidden_state: Tensor) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.patch_vectors.insert(layer_idx, hidden_state);
+    }
+
+    /// Clear all activation patches.
+    pub fn clear_patches(&self) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.patch_vectors.clear();
+    }
+
+    // ── GDN Recurrent State Read ────────────────────────────────────
+
+    /// Extract GDN recurrent states from the local cache after a forward pass.
+    /// Returns (layer_idx, recurrent_state) for each GDN layer.
+    /// Shape: (1, num_v_heads, head_k_dim, head_v_dim)
+    pub fn gdn_recurrent_states(&self) -> Result<Vec<(usize, Tensor)>> {
+        let cache = self.local_cache.lock().unwrap();
+        let mut states = Vec::new();
+        for (i, lc) in cache.caches.iter().enumerate() {
+            if let LocalLayerCache::LinearAttention(gdn_cache) = lc {
+                states.push((i, gdn_cache.recurrent_state.clone()));
+            }
+        }
+        Ok(states)
     }
 
     /// Get the number of decoder layers.

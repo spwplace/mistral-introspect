@@ -12,6 +12,9 @@ categories.workspace = true
 license.workspace = true
 homepage.workspace = true
 
+[lib]
+crate-type = ["dylib", "lib"]
+
 [dependencies]
 anyhow.workspace = true
 candle-core.workspace = true

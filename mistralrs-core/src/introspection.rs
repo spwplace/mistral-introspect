@@ -18,7 +18,7 @@ use tokenizers::Tokenizer;
 
 use crate::device_map::DummyDeviceMapper;
 use crate::models::{qwen2, qwen3_next};
-use crate::models::qwen3_next::IntrospectionState;
+use crate::models::qwen3_next::{IntrospectionState, MoeRoutingData};
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::{
     text_models_inputs_processor::FlashParams, NormalLoadingMetadata,
@@ -110,6 +110,53 @@ impl ModelBackend {
         match self {
             Self::Qwen3Next { model, .. } => &model.introspection,
             Self::Qwen2 { model, .. } => &model.introspection,
+        }
+    }
+
+    // ── MoE Routing ─────────────────────────────────────────────────
+
+    fn set_capture_routing(&self, capture: bool) {
+        match self {
+            Self::Qwen3Next { model, .. } => model.set_capture_routing(capture),
+            Self::Qwen2 { .. } => {} // no MoE in Qwen2
+        }
+    }
+
+    fn take_routing_data(&self) -> Vec<MoeRoutingData> {
+        match self {
+            Self::Qwen3Next { model, .. } => model.take_routing_data(),
+            Self::Qwen2 { .. } => Vec::new(),
+        }
+    }
+
+    // ── Activation Patching ─────────────────────────────────────────
+
+    fn set_patch(&self, layer_idx: usize, hidden_state: Tensor) {
+        match self {
+            Self::Qwen3Next { model, .. } => model.set_patch(layer_idx, hidden_state),
+            Self::Qwen2 { model, .. } => {
+                let mut intro = model.introspection.lock().unwrap();
+                intro.patch_vectors.insert(layer_idx, hidden_state);
+            }
+        }
+    }
+
+    fn clear_patches(&self) {
+        match self {
+            Self::Qwen3Next { model, .. } => model.clear_patches(),
+            Self::Qwen2 { model, .. } => {
+                let mut intro = model.introspection.lock().unwrap();
+                intro.patch_vectors.clear();
+            }
+        }
+    }
+
+    // ── GDN Recurrent State ─────────────────────────────────────────
+
+    fn gdn_recurrent_states(&self) -> candle_core::Result<Vec<(usize, Tensor)>> {
+        match self {
+            Self::Qwen3Next { model, .. } => model.gdn_recurrent_states(),
+            Self::Qwen2 { .. } => Ok(Vec::new()), // no GDN layers
         }
     }
 }
@@ -696,6 +743,52 @@ impl IntrospectionModel {
 
         Ok(activations)
     }
+
+    // ── MoE Routing Capture ─────────────────────────────────────────
+
+    /// Enable or disable MoE routing capture for subsequent forward passes.
+    pub fn set_capture_routing(&self, capture: bool) {
+        self.backend.set_capture_routing(capture);
+    }
+
+    /// Take captured MoE routing data, leaving the buffer empty.
+    pub fn take_routing_data(&self) -> Vec<MoeRoutingData> {
+        self.backend.take_routing_data()
+    }
+
+    /// Run a forward pass with routing capture enabled.
+    /// Returns (logits, hidden_states, routing_data).
+    pub fn forward_introspect_with_routing(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<(Tensor, Vec<Tensor>, Vec<MoeRoutingData>)> {
+        self.set_capture_routing(true);
+        let result = self.forward_introspect(text)?;
+        let routing = self.take_routing_data();
+        self.set_capture_routing(false);
+        Ok((result.logits, result.hidden_states, routing))
+    }
+
+    // ── Activation Patching ─────────────────────────────────────────
+
+    /// Set a patch vector that REPLACES the hidden state at the given layer.
+    pub fn set_patch(&self, layer_idx: usize, hidden_state: Tensor) {
+        self.backend.set_patch(layer_idx, hidden_state);
+    }
+
+    /// Clear all activation patches.
+    pub fn clear_patches(&self) {
+        self.backend.clear_patches();
+    }
+
+    // ── GDN Recurrent State ─────────────────────────────────────────
+
+    /// Extract GDN recurrent states from the cache after a forward pass.
+    /// Returns (layer_idx, recurrent_state) for each GDN layer.
+    /// Empty on non-GDN models.
+    pub fn gdn_recurrent_states(&self) -> anyhow::Result<Vec<(usize, Tensor)>> {
+        Ok(self.backend.gdn_recurrent_states()?)
+    }
 }
 
 /// Result of autoregressive generation.
@@ -743,6 +836,19 @@ fn sample_token(
     let sum = exp.sum_all()?;
     let probs = exp.broadcast_div(&sum)?;
     let mut probs_vec: Vec<f32> = probs.to_vec1()?;
+
+    // Clamp NaN/Inf/negative to 0 (can happen with aggressive steering)
+    for p in probs_vec.iter_mut() {
+        if !p.is_finite() || *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+    // Ensure at least one non-zero probability
+    if probs_vec.iter().all(|&p| p == 0.0) {
+        // Fall back to argmax on original logits
+        let argmax = logits_1d.argmax(0)?;
+        return Ok(argmax.to_scalar::<u32>()?);
+    }
 
     // Top-p nucleus sampling
     if let Some(p) = top_p {

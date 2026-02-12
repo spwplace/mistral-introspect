@@ -548,7 +548,7 @@ impl Model {
                 flash_params,
             )?;
 
-            // Introspection: capture hidden state after this layer, inject steering vector
+            // Introspection: capture, steer, patch
             {
                 let mut intro = self.introspection.lock().unwrap();
                 let capture_idx = i + 1;
@@ -567,6 +567,9 @@ impl Model {
                         sv.clone()
                     };
                     xs = xs.broadcast_add(&sv)?;
+                }
+                if let Some(patch) = intro.patch_vectors.get(&i) {
+                    xs = patch.to_dtype(xs.dtype())?.clone();
                 }
             }
         }
@@ -601,6 +604,7 @@ impl Model {
             let mut intro = self.introspection.lock().unwrap();
             intro.capture = true;
             intro.hidden_states.clear();
+            intro.routing_data.clear();
         }
 
         let logits =
