@@ -410,6 +410,10 @@ struct GatedDeltaNet {
     conv_kernel_size: usize,
     key_dim: usize,
     value_dim: usize,
+    /// TP rank for sharding GDN output before out_proj
+    tp_rank: usize,
+    /// TP world size
+    tp_world_size: usize,
 }
 
 impl GatedDeltaNet {
@@ -514,6 +518,8 @@ impl GatedDeltaNet {
             conv_kernel_size,
             key_dim,
             value_dim,
+            tp_rank: comm.rank(),
+            tp_world_size: comm.world_size(),
         })
     }
 
@@ -750,8 +756,17 @@ impl GatedDeltaNet {
         let y = y.reshape((batch_size, seq_len, self.value_dim))?;
 
         // 11. Output projection
+        // Under TP, in_proj_qkvz is Replicated (all ranks compute full value_dim),
+        // but out_proj is RowParallelLayer with weight sharded along value_dim.
+        // Narrow y to this rank's shard so dimensions match the sharded weight.
         let original_dtype = x.dtype();
-        let mut y_proj = y;
+        let mut y_proj = if self.tp_world_size > 1 {
+            let shard_size = self.value_dim / self.tp_world_size;
+            y.narrow(D::Minus1, self.tp_rank * shard_size, shard_size)?
+                .contiguous()?
+        } else {
+            y
+        };
         if let Some(t) = self.out_proj.quantized_act_type() {
             y_proj = y_proj.to_dtype(t)?;
         }
