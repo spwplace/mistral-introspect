@@ -16,7 +16,7 @@ use mistralrs_quant::ShardedSafeTensors;
 use serde::Serialize;
 use tokenizers::Tokenizer;
 
-use crate::device_map::DummyDeviceMapper;
+use crate::device_map::{DummyDeviceMapper, NcclDeviceMapper};
 use crate::models::{qwen2, qwen3_next};
 use crate::models::qwen3_next::{IntrospectionState, MoeRoutingData};
 use crate::paged_attention::AttentionImplementation;
@@ -218,6 +218,8 @@ struct ConfigProbe {
     architectures: Vec<String>,
     #[serde(default)]
     model_type: String,
+    #[serde(default)]
+    num_hidden_layers: usize,
 }
 
 impl IntrospectionModel {
@@ -228,7 +230,16 @@ impl IntrospectionModel {
     /// - An absolute/relative path to a local model directory
     ///
     /// The model type is auto-detected from `config.json`.
-    pub fn load(model_path: &str, device: Device, dtype: DType) -> anyhow::Result<Self> {
+    ///
+    /// When `comm` is `Some`, enables tensor parallelism: weights are sharded
+    /// across NCCL ranks and collective operations are used during forward passes.
+    /// When `None`, loads all weights on a single device (Metal/single-GPU path).
+    pub fn load(
+        model_path: &str,
+        device: Device,
+        dtype: DType,
+        comm: Option<Arc<mistralrs_quant::Comm>>,
+    ) -> anyhow::Result<Self> {
         let (config_path, weight_files, tokenizer_path) = if Path::new(model_path).is_dir() {
             Self::resolve_local_paths(model_path)?
         } else {
@@ -256,10 +267,25 @@ impl IntrospectionModel {
             )?
         };
 
-        let normal_loading_metadata = NormalLoadingMetadata {
-            mapper: Box::new(DummyDeviceMapper {
+        let mapper: Box<dyn crate::device_map::DeviceMapper + Send + Sync> = match &comm {
+            Some(c) => {
+                tracing::info!(
+                    "Using NcclDeviceMapper (TP world_size={})",
+                    c.world_size()
+                );
+                Box::new(NcclDeviceMapper::new(
+                    device.clone(),
+                    probe.num_hidden_layers,
+                    Some(c.clone()),
+                ))
+            }
+            None => Box::new(DummyDeviceMapper {
                 nm_device: device.clone(),
             }),
+        };
+
+        let normal_loading_metadata = NormalLoadingMetadata {
+            mapper,
             loading_isq: false,
             real_device: device.clone(),
             multi_progress: Arc::new(MultiProgress::new()),

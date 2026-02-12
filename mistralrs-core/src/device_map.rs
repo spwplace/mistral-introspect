@@ -452,6 +452,20 @@ pub struct NcclDeviceMapper {
     comm: Option<Arc<mistralrs_quant::Comm>>,
 }
 
+impl NcclDeviceMapper {
+    pub fn new(
+        nm_device: Device,
+        model_layers: usize,
+        comm: Option<Arc<mistralrs_quant::Comm>>,
+    ) -> Self {
+        Self {
+            nm_device,
+            model_layers,
+            comm,
+        }
+    }
+}
+
 impl DeviceMapper for NcclDeviceMapper {
     fn map(&self, input: Tensor, _: usize) -> Result<Tensor> {
         Ok(input)
